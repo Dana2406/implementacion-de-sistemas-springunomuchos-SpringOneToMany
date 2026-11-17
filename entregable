@@ -1,0 +1,217 @@
+# Entregable — Spring Boot con JPA: relación uno a muchos
+
+Práctica: `implementacion-de-sistemas-springunomuchos-SpringOneToMany`
+
+Repositorio resuelto: https://github.com/Dana2406/implementacion-de-sistemas-springunomuchos-SpringOneToMany
+
+Las respuestas se verificaron ejecutando la API con PostgreSQL 17 y Java 21 (Hibernate 6.1.7), revisando
+el esquema que crea `spring.jpa.hibernate.ddl-auto=update` y el SQL que imprime `spring.jpa.show-sql=true`.
+
+---
+
+## 1. Modelos, controladores y repositorios
+
+### Anotaciones que configuran la relación
+
+| Elemento | Dónde | Qué hace |
+| --- | --- | --- |
+| `@Entity` | `Product`, `Comment` | Marca la clase como entidad persistente de JPA. |
+| `@Table(name = "producto")` / `@Table(name = "comentarios")` | `Product`, `Comment` | Fija el nombre de la tabla. |
+| `@Id` | `Product.id`, `Comment.id` | Clave primaria. |
+| `@GeneratedValue(strategy = GenerationType.UUID)` | `Product.id`, `Comment.id` | Genera un UUID para cada registro nuevo. |
+| `@OneToMany(mappedBy = "producto", cascade = CascadeType.ALL, fetch = FetchType.EAGER)` | `Product.comentarios` | Lado **inverso** de la relación: un producto tiene muchos comentarios. |
+| `@ManyToOne(fetch = FetchType.LAZY)` | `Comment.producto` | Lado **propietario**: muchos comentarios pertenecen a un producto. Aquí vive la llave foránea. |
+| `@JsonManagedReference` / `@JsonBackReference` | `Product.comentarios` / `Comment.producto` | Evitan que Jackson serialize la relación en ambos sentidos (recursión infinita). |
+| `@Setter` | `Product.id`, `Comment.id`, `Product.comentarios`, `Comment.producto` | Genera setters solo en los campos que los controladores necesitan modificar. |
+| `@Getter`, `@Builder`, `@NoArgsConstructor`, `@AllArgsConstructor` | Ambas entidades | Lombok: getters, builder y constructores. No generan setters. |
+
+`mappedBy = "producto"` se refiere al **nombre de la propiedad Java** (`Comment.producto`), no a la tabla
+ni a la columna. Gracias a esto JPA sabe que la llave foránea la administra `Comment`.
+
+### Endpoint que asigna el producto al comentario
+
+`POST /comentario/{productId}` en `demo/src/main/java/com/example/demo/controllers/Comentario.java`:
+
+```java
+@PostMapping("comentario/{productId}")
+public Comment addcomentario(@RequestBody Comment comentario, @PathVariable String productId) {
+    Optional<Product> p = repoProducto.findById(productId);
+    if (p.isPresent()) {
+        comentario.setProducto(p.get());   // <-- aquí se asocia el comentario con el producto
+    }
+    return repo.save(comentario);
+}
+```
+
+Busca el producto por su `id`, y si existe hace `comentario.setProducto(...)` antes de guardar. Si el id
+no existe no asigna nada y el comentario se guarda con `producto_id` en `NULL` (la columna lo permite).
+El otro endpoint, `POST /comentario`, guarda el comentario tal cual, también sin producto.
+
+Los repositorios (`productoRepo`, `comentarioRepo`) solo extienden `JpaRepository<Product, String>` y
+`JpaRepository<Comment, String>`: no declaran consultas propias, y el segundo parámetro `String` indica
+el tipo de la llave primaria.
+
+---
+
+## 2. Esquema creado por Hibernate
+
+Hibernate generó exactamente este DDL (tomado del log de arranque):
+
+```sql
+create table comentarios (
+    id varchar(255) not null,
+    comentario_corto varchar(255),
+    comentario_largo varchar(255),
+    estrellas smallint,
+    imagen1 varchar(255),
+    imagen2 varchar(255),
+    username varchar(255),
+    producto_id varchar(255),
+    primary key (id)
+);
+
+create table producto (
+    id varchar(255) not null,
+    descripcion varchar(255),
+    fecha_caducidad date,
+    lote varchar(255),
+    nombre varchar(255),
+    precio_unitario float4 not null,
+    primary key (id)
+);
+
+alter table if exists comentarios
+    add constraint FK154ycvjq68cds92ddfbpfnt4m foreign key (producto_id) references producto;
+```
+
+`\d producto` y `\d comentarios` en `psql` confirman:
+
+- Clave primaria de `producto`: `producto_pkey (id)`.
+- Clave primaria de `comentarios`: `comentarios_pkey (id)`.
+- Llave foránea: `comentarios.producto_id → producto.id` (restricción `fk154ycvjq68cds92ddfbpfnt4m`),
+  **sin** `ON DELETE CASCADE` y **nullable**.
+- `precio_unitario` es `real NOT NULL` porque el campo es el primitivo `float`, no `Float`.
+- Los `id` son `varchar(255)` y no `uuid` porque los campos están declarados como `String`.
+
+---
+
+## 3. Respuestas
+
+### a) ¿En qué tabla queda la llave foránea y qué propiedad de Java la controla?
+
+En la tabla **`comentarios`**, es decir, en el lado "muchos" de la relación. La controla la propiedad
+**`Comment.producto`** (`@ManyToOne`, sin `mappedBy`), que es el lado propietario y la que Hibernate traduce
+a la columna `producto_id`. `Product.comentarios` es el lado inverso: no tiene columna en la base y solo
+refleja lo que dice `Comment.producto`.
+
+Por eso, cuando se crea un comentario por `POST /comentario/{productId}`, lo que realmente escribe la
+llave foránea es `comentario.setProducto(producto)`.
+
+### b) ¿Cuál es la diferencia entre `List` y `Set`?
+
+- **`List`**: colección **ordenada** y con acceso por índice; **permite duplicados**. En JPA se mapea como
+  *bag* y, si hace falta conservar el orden, se necesita `@OrderColumn` o `@OrderBy`.
+- **`Set`**: colección **sin orden garantizado** y **sin duplicados**, según `equals` y `hashCode`. JPA lo
+  mapea como conjunto y, si se quiere un orden estable al consultar, hay que pedirlo con `@OrderBy`.
+
+`Product` usa `Set<Comment>`, así que la misma entidad no puede aparecer dos veces en la colección. Eso
+también implica cuidar `equals`/`hashCode`: aquí las entidades usan Lombok `@Getter`/`@Builder` sin
+`@EqualsAndHashCode`, por lo que la igualdad es **por identidad de objeto**. Dos instancias distintas con
+el mismo `id` se considerarían diferentes dentro del `Set`, y un `Set` con `fetch = EAGER` y `JOIN` puede
+duplicar filas (Hibernate las deduplica al hidratar el `Set`). Con una `List`, en cambio, esos duplicados
+aparecerían tal cual y además se podrían repetir comentarios.
+
+### c) ¿Por qué los identificadores son `String` y qué tipo de valor guardan?
+
+Guardan **el texto de un UUID**: un valor de 128 bits que se escribe con 32 dígitos hexadecimales en cinco
+grupos, por ejemplo `62cd72ad-22de-4f57-9fb7-a9b9ded9375a` (36 caracteres contando guiones). No es un
+número ni un consecutivo, y el orden alfabético de los ids **no** refleja el orden de creación.
+
+Son `String` porque `@GeneratedValue(strategy = GenerationType.UUID)` produce un `java.util.UUID` y el
+campo lo guarda como `String`: Hibernate genera el UUID en Java (antes del `INSERT`, sin ida y vuelta a la
+base) y lo convierte a su representación textual. Así el id viaja tal cual en el JSON de la API sin
+conversiones en el controlador. Consecuencia visible en el esquema: la columna es `varchar(255)`, no
+`uuid`; si el campo se declarara como `java.util.UUID`, Hibernate usaría el tipo nativo `uuid` de
+PostgreSQL y la base validaría el formato.
+
+Ventajas frente a un consecutivo: no revela cuántos registros hay, se puede generar en la aplicación o en
+varios nodos sin coordinarse y no colisiona. Desventaja: ocupa más espacio en la columna y en el índice
+que un `bigint`.
+
+### d) ¿Qué ocurre al eliminar un producto con comentarios asociados? ¿Qué cambia si se quita `CascadeType.ALL`?
+
+**Con `CascadeType.ALL` (como está el proyecto):** `DELETE /producto/{id}` termina en
+`repo.deleteById(id)` y Hibernate propaga `REMOVE` del producto a sus comentarios. En el log se observa:
+
+```sql
+select ... from producto p1_0 left join comentarios c1_0 on p1_0.id = c1_0.producto_id where p1_0.id = ?
+delete from comentarios where id = ?
+delete from producto where id = ?
+```
+
+Es decir, primero borra cada comentario y luego el producto, todo dentro de la misma transacción, y ambas
+tablas quedan sin filas. Importante: **no** es un `ON DELETE CASCADE` de PostgreSQL. La cascada la hace
+JPA/Hibernate en la aplicación, con `DELETE` individuales, y solo cuando el borrado se hace a través de
+JPA. Si se borra la fila con SQL directo, la base rechaza la operación:
+
+```
+ERROR: update or delete on table "producto" violates foreign key constraint
+       "fk154ycvjq68cds92ddfbpfnt4m" on table "comentarios"
+```
+
+**Si se quita `CascadeType.ALL`:** Hibernate borra únicamente la fila de `producto` y no toca los
+comentarios. Como la llave foránea es una restricción normal (sin `ON DELETE CASCADE`), PostgreSQL rechaza
+el borrado si hay comentarios y la API responde **HTTP 500**:
+
+```
+org.postgresql.util.PSQLException: ERROR: update or delete on table "producto" violates
+foreign key constraint "fk154ycvjq68cds92ddfbpfnt4m" on table "comentarios"
+→ org.springframework.dao.DataIntegrityViolationException
+```
+
+Ambas filas permanecen. Lo comprobé quitando `cascade = CascadeType.ALL` de `Product.comentarios`,
+recompilando y repitiendo el `DELETE`; después restauré el código original. Nótese que la cascada va solo
+de `Product` hacia `Comment`, nunca al revés: borrar un comentario no afecta al producto. Y como no hay
+`orphanRemoval = true`, sacar un comentario del `Set` no lo elimina de la base.
+
+### e) ¿Qué diferencia práctica hay entre los `FetchType` usados en `Product` y `Comment`?
+
+`Product.comentarios` es **`EAGER`**: al cargar un producto sus comentarios se traen en la misma operación.
+Por eso `GET /productos` y `GET /producto/{id}` devuelven el arreglo `comentarios` con datos, y funciona
+aunque `spring.jpa.open-in-view=false` cierre la sesión antes de serializar: la colección ya está
+inicializada.
+
+`Comment.producto` es **`LAZY`**: al cargar un comentario **no** se trae el producto, solo un proxy que se
+resuelve si se accede a él. Por eso `GET /comentarios` y `GET /comentarios/{productId}` responden solo con
+los campos del comentario y sin un objeto `producto` anidado (además `@JsonBackReference` lo omite al
+serializar). Si se intentara leer `comentario.getProducto()` fuera de la transacción, con
+`open-in-view=false` se produciría `LazyInitializationException`.
+
+Diferencias prácticas observadas:
+
+- **Costo:** con `EAGER`, `GET /productos` hace **N+1** consultas: una para los productos y una por cada
+  producto para sus comentarios. Con `GET /producto/{id}`, Hibernate 6.1.7 resolvió todo en un solo
+  `SELECT ... LEFT JOIN`. Un `LAZY` habría hecho una sola consulta a `producto` y solo iría por los
+  comentarios si se pidieran.
+- **Datos de más:** `EAGER` trae todos los comentarios aunque el cliente no los necesite (con muchos
+  comentarios por producto, la respuesta crece mucho); `LAZY` permite decidir cuándo pagar ese costo.
+- **Riesgo:** `EAGER` puede ocultar problemas de rendimiento; `LAZY` exige mantener abierta la sesión o
+  usar `JOIN FETCH`/`@EntityGraph` cuando de verdad se necesitan los datos relacionados.
+
+Ojo: `EAGER` no garantiza un único `JOIN`; garantiza que la relación esté inicializada al usar la entidad.
+
+---
+
+## 4. Comprobación con la API
+
+Secuencia ejecutada contra `http://localhost:8080` con la base `chochos` vacía:
+
+1. `POST /producto` → `201/200` con `id` UUID y `"comentarios": null`.
+2. `POST /comentario/{id}` → comentario guardado; la respuesta **no** incluye `producto`.
+3. `GET /productos` → el producto incluye su arreglo `comentarios` (por el `EAGER`).
+4. `GET /comentarios` → lista de comentarios **sin** el producto anidado (por el `LAZY` + `@JsonBackReference`).
+5. `GET /comentarios/{idProducto}` → devuelve el `Set` de comentarios de ese producto.
+6. `DELETE /producto/{id}` → `{"success":true}`; los comentarios también desaparecen (cascada de JPA).
+7. Sin `CascadeType.ALL` → `DELETE` responde `500` y las filas siguen ahí (violación de llave foránea).
+
+Con esto el entregable coincide con el esquema y el comportamiento observado.
